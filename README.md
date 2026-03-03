@@ -19,13 +19,13 @@ AI agents need API keys and tokens to do useful work. But:
 
 ## The Solution
 
-Laurin is a credential proxy that sits on **your hardware**, between your AI agents and the APIs they need to call. Agents request actions by **reference** — they never see the actual secret values.
+Laurin is a credential proxy that sits on **a dedicated server your agents can't access**, between your AI agents and the APIs they need to call. Agents request actions by **reference** — they never see the actual secret values.
 
 ```
 ┌─────────────┐     "use github-dizyx     ┌─────────────┐    GET + real token
 │  Cloud Agent │ ──── to GET /repos" ────→ │   Laurin    │ ─────────────────→  GitHub API
-│  (Claude,    │     (no token, just       │  (your box, │
-│   GPT, etc.) │      a reference name)    │   your LAN) │
+│  (Claude,    │     (no token, just       │  (dedicated │
+│   GPT, etc.) │      a reference name)    │   VPS)      │
 └─────────────┘                            └─────────────┘
 ```
 
@@ -33,49 +33,71 @@ The agent says **what** it wants. Laurin decides **whether** it's allowed, injec
 
 ## How It Works
 
-### Three Trust Zones
+### Architecture: Three Machines, Three Trust Levels
 
-1. **Cloud Zone (untrusted)** — Your cloud servers, AI agents, LLM providers. Can only call Laurin's proxy API endpoint.
-2. **Home Zone (trusted)** — Dedicated hardware running Laurin on your local network, isolated via Tailscale ACLs. No SSH from cloud. API port only.
-3. **Human Zone (fallback)** — Your laptop, your password manager. Agent-proof. Always accessible if Laurin goes down.
+```
+┌─────────────────────────────────────────────────────┐
+│  Gateway Server (Hetzner)                            │
+│  AI agents + Claude Code (untrusted shell access)    │
+│  Can ONLY call Laurin API port via Tailscale         │
+└─────────────┬───────────────────────────────────────┘
+              │ Tailscale (port 3600 only)
+              ▼
+┌─────────────────────────────────────────────────────┐
+│  Laurin VPS (Hetzner CX22, ~€4/month)               │
+│  Proxy server + Postgres + secret storage            │
+│  No agents, no Claude Code, no shell from cloud      │
+│  Deterministic code only — secrets never leave here  │
+└─────────────┬───────────────────────────────────────┘
+              │ Tailscale (LLM port only, outbound)
+              ▼
+┌─────────────────────────────────────────────────────┐
+│  DGX Spark (home network)                            │
+│  Local LLM for judgment calls (Qwen3-30B, etc.)     │
+│  Never sees secret values — only ref names, patterns │
+└─────────────────────────────────────────────────────┘
+```
+
+**Key principle:** The local LLM never touches credentials. 95% of requests are pure deterministic code (Postgres lookup → allow/deny → inject → proxy). The LLM only handles edge cases: new endpoint patterns, anomaly detection, allowlist generation.
 
 ### Credential Tiers
 
-| Tier | Behavior | Example |
-|------|----------|---------|
-| **Auto-allow** | Instant passthrough, just log | GitHub API reads, CDN fetches |
-| **Rate-limited** | Passthrough with limits | GitHub API writes (max 20/hour) |
-| **Ask once** | Ping human, allow for N hours | New API endpoint, new domain |
-| **Always ask** | Every call needs human approval | Billing APIs, deletions, admin |
+| Tier | Behavior | Decision Maker | Example |
+|------|----------|---------------|---------|
+| **Auto-allow** | Instant passthrough, just log | Deterministic code | GitHub API reads, CDN fetches |
+| **Rate-limited** | Passthrough with limits | Deterministic code | GitHub API writes (max 20/hour) |
+| **Ask once** | Approve for N hours | Human (Nockerl Inbox) | New API endpoint, new domain |
+| **Always ask** | Every call needs approval | Human (Nockerl Inbox) | Billing APIs, deletions, admin |
 
 ### Smart Local LLM
 
-A small local model (Qwen, Devstral, etc.) runs alongside the proxy to:
+A small local model (Qwen, Devstral, etc.) runs on separate hardware and handles administrative tasks:
 
 - Manage allowlists — "I added a new GitHub token, set up typical API rules"
-- Rotate credentials automatically via Infisical API
+- Evaluate new request patterns — "Is this consistent with typical usage?"
 - Detect anomalies in audit logs
-- Send weekly summaries via Telegram
+- Send weekly summaries via Nockerl Inbox
 
-The local LLM is deliberately small and isolated. It can't be prompt-injected remotely because it's not connected to any cloud LLM provider. It's a dumb, stubborn guard dog — and that's the point.
+The local LLM is deliberately small and isolated. It can't be prompt-injected remotely because it's not connected to any cloud LLM provider. And critically — **it never sees secret values**. It works with reference names, domain patterns, and audit summaries. The actual credential injection is handled entirely by deterministic application code.
 
 ### Security Model
 
-- **Physical trust boundary** — Laurin runs on separate hardware you own
-- **Tailscale ACL lockdown** — Cloud servers can only reach the proxy API port (no SSH, no other services)
+- **Physical trust boundary** — Laurin runs on a dedicated VPS that agents cannot access
+- **Tailscale ACL lockdown** — Cloud servers can only reach the proxy API port (no SSH, no Postgres, no other services)
 - **Domain allowlisting** — Each credential is locked to specific domains, methods, and paths
-- **No credential in context** — The LLM never sees token values, not in prompts, not in responses
+- **No credential in any LLM context** — Not in cloud LLMs, not in local LLMs. Secrets are only touched by deterministic code.
 - **Audit logging** — Every credential use logged with agent ID, URL, method, timestamp
+- **Human-in-the-loop** — Nockerl Inbox with actionable notifications + FCM push for approvals
 
 ## Tech Stack
 
 - **Runtime:** [Bun](https://bun.sh)
 - **Framework:** [Hono](https://hono.dev)
 - **Database:** PostgreSQL (allowlists + audit log)
-- **Secret Storage:** [Infisical](https://infisical.com) (self-hosted or cloud)
-- **Local LLM:** Any tool-use capable model (Qwen3-30B, Devstral, etc.)
+- **Secret Storage:** [Infisical](https://infisical.com) Cloud (free tier, E2E encrypted) + SOPS/age backup
+- **Local LLM:** Any tool-use capable model on DGX Spark (Qwen3-30B, Devstral, etc.)
 - **Networking:** [Tailscale](https://tailscale.com) (ACL-restricted)
-- **Notifications:** Telegram bot (human-in-the-loop approvals)
+- **Approvals:** [Nockerl](https://nockerl.dizyx.com) Inbox (actionable notifications + FCM push)
 - **Protocol:** MCP server for universal AI tool compatibility
 
 ## Project Status
@@ -108,11 +130,11 @@ From Tyrolean/Austrian Alpine legend:
 
 | Legend | Laurin (the project) |
 |-------|---------------------|
-| Dwarf King — small but rules a kingdom | Small local LLM — limited but controls all credentials |
+| Dwarf King — small but rules a kingdom | Small proxy — limited but controls all credentials |
 | Cloak of invisibility | Your secrets are invisible to cloud agents |
-| Belt of 12 men's strength | Small model punches above its weight |
+| Belt of 12 men's strength | Small server punches above its weight |
 | "Touch my roses and lose your hand" | Hit an unauthorized URL and get blocked |
-| Lives underground, hidden from the world | Lives on your home network, hidden behind Tailscale |
+| Lives underground, hidden from the world | Lives on a locked-down VPS, hidden behind Tailscale |
 
 ## License
 

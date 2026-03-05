@@ -38,6 +38,14 @@ export const config = {
 
   // Nockerl Gateway (for inbox notifications)
   gatewayUrl: optionalEnv("GATEWAY_URL", "http://100.112.204.112:3500"),
+
+  // Authentication
+  auth: {
+    /** API key for Gateway → Laurin calls. Empty string disables auth (for testing). */
+    apiKey: optionalEnv("LAURIN_API_KEY", ""),
+    /** Comma-separated list of allowed source IPs (Tailscale IPs) */
+    allowedIps: optionalEnv("LAURIN_ALLOWED_IPS", "100.112.204.112").split(",").map((s) => s.trim()).filter(Boolean),
+  },
 } as const
 
 export type Config = typeof config

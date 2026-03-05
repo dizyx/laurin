@@ -8,7 +8,7 @@
 import { Hono } from "hono"
 import { z } from "zod"
 import { checkAllowlist } from "./allowlist.ts"
-import { injectAndProxy } from "./injector.ts"
+import { injectAndProxy, SsrfBlockedError } from "./injector.ts"
 import { getSecret } from "../secrets/infisical.ts"
 import { db } from "../db/index.ts"
 import { auditLog } from "../db/schema.ts"
@@ -143,6 +143,29 @@ proxyRouter.post("/proxy", async (c) => {
       body: result.body,
     })
   } catch (err) {
+    // SSRF blocked — return 403
+    if (err instanceof SsrfBlockedError) {
+      logger.warn("SSRF blocked", {
+        credentialRef,
+        method,
+        url,
+        reason: err.message,
+        agentId,
+      })
+
+      await db.insert(auditLog).values({
+        credentialRef,
+        agentId,
+        method,
+        url,
+        decision: "denied",
+        metadata: { error: "SSRF blocked", reason: err.message },
+        latencyMs: Math.round(performance.now() - startTime),
+      })
+
+      return c.json({ error: "Blocked", reason: err.message }, 403)
+    }
+
     logger.error("Proxy request failed", {
       credentialRef,
       method,

@@ -8,8 +8,9 @@ import { describe, test, expect } from "bun:test"
 import { injectAndProxy } from "../src/proxy/injector.ts"
 
 describe("injectAndProxy", () => {
-  test("injects Authorization header and returns response", async () => {
-    // httpbin.org/headers echoes back the request headers
+  test("injects Authorization header and redacts it from response body", async () => {
+    // httpbin.org/headers echoes back the request headers — the secret
+    // should be redacted in the response body
     const result = await injectAndProxy(
       "test-secret-token",
       "GET",
@@ -19,10 +20,11 @@ describe("injectAndProxy", () => {
     expect(result.status).toBe(200)
     expect(result.latencyMs).toBeGreaterThan(0)
 
-    // The response body should contain the injected auth header
-    // (httpbin echoes request headers back)
+    // The response body should have the secret REDACTED
+    // (httpbin echoes request headers back, redaction catches this)
     const body = result.body as { headers: Record<string, string> }
-    expect(body.headers["Authorization"]).toBe("Bearer test-secret-token")
+    expect(body.headers["Authorization"]).toBe("Bearer [REDACTED_BY_LAURIN]")
+    expect(body.headers["Authorization"]).not.toContain("test-secret-token")
   })
 
   test("strips credential-related headers from response", async () => {
@@ -68,8 +70,9 @@ describe("injectAndProxy", () => {
 
   test("does NOT forward agent's Authorization header", async () => {
     // Even if the agent tries to sneak in an auth header, it should be overwritten
+    // with the real token (which then gets redacted in the httpbin echo response)
     const result = await injectAndProxy(
-      "real-token",
+      "real-token-value-here",
       "GET",
       "https://httpbin.org/headers",
       { Authorization: "Bearer agent-sneaky-token" },
@@ -77,8 +80,10 @@ describe("injectAndProxy", () => {
 
     expect(result.status).toBe(200)
     const body = result.body as { headers: Record<string, string> }
-    // Should be the REAL token, not the agent's attempt
-    expect(body.headers["Authorization"]).toBe("Bearer real-token")
+    // Should be the REAL token (redacted), not the agent's attempt
+    expect(body.headers["Authorization"]).toBe("Bearer [REDACTED_BY_LAURIN]")
+    // Agent's fake token should NOT appear
+    expect(body.headers["Authorization"]).not.toContain("agent-sneaky-token")
   })
 
   test("handles non-JSON responses", async () => {

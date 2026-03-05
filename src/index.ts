@@ -14,12 +14,32 @@ import { adminRouter } from "./admin/routes.ts"
 import { testConnection, closeDatabase } from "./db/index.ts"
 import { config } from "./lib/config.ts"
 import { logger } from "./lib/logger.ts"
+import { createAuthMiddleware } from "./middleware/auth.ts"
 
 const app = new Hono()
 
 // Middleware
 app.use("*", cors())
 app.use("*", honoLogger())
+
+// Gateway caller authentication (API key + IP allowlist)
+// Disabled when LAURIN_API_KEY is empty (development/testing)
+if (config.auth.apiKey) {
+  logger.info("Auth middleware enabled", {
+    allowedIps: config.auth.allowedIps,
+    exemptPaths: ["/health"],
+  })
+  app.use(
+    "*",
+    createAuthMiddleware({
+      apiKey: config.auth.apiKey,
+      allowedIps: new Set(config.auth.allowedIps),
+      exemptPaths: new Set(["/health"]),
+    }),
+  )
+} else {
+  logger.warn("Auth middleware DISABLED — LAURIN_API_KEY not set")
+}
 
 // Health check
 app.get("/health", async (c) => {

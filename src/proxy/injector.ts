@@ -1,11 +1,18 @@
 /**
- * Credential injection and response stripping.
+ * Credential injection, response stripping, and body redaction.
  *
  * Injects the real secret into the outbound request headers,
- * makes the API call, and strips any credential-related headers
- * from the response before returning to the agent.
+ * makes the API call, strips any credential-related headers
+ * from the response, and scans the response body for any leaked
+ * secret values before returning to the agent.
+ *
+ * Security features:
+ * - SSRF protection: blocks requests to internal/metadata endpoints
+ * - Response header stripping: removes auth-related headers
+ * - Response body redaction: replaces leaked token values with [REDACTED_BY_LAURIN]
  */
 import { logger } from "../lib/logger.ts"
+import { checkSsrf } from "./ssrf-guard.ts"
 
 /** Headers that must NEVER be returned to the agent */
 const STRIPPED_RESPONSE_HEADERS = new Set([
@@ -46,6 +53,17 @@ export async function injectAndProxy(
   agentBody?: unknown,
 ): Promise<InjectionResult> {
   const startTime = performance.now()
+
+  // SSRF check — block requests to internal networks, metadata endpoints, etc.
+  const ssrfCheck = await checkSsrf(url)
+  if (!ssrfCheck.allowed) {
+    logger.warn("SSRF blocked in proxy", {
+      url,
+      reason: ssrfCheck.reason,
+      resolvedIp: ssrfCheck.resolvedIp,
+    })
+    throw new SsrfBlockedError(ssrfCheck.reason)
+  }
 
   // Build outbound headers — inject the credential
   const outboundHeaders: Record<string, string> = {
@@ -96,19 +114,42 @@ export async function injectAndProxy(
     }
   })
 
-  // Parse response body
+  // Parse response body and redact any leaked secret values
   let body: unknown
+  let redacted = false
   const contentType = response.headers.get("content-type") ?? ""
+
   if (contentType.includes("application/json")) {
-    body = await response.json()
+    // For JSON responses, get as text first so we can scan for leaks
+    const rawText = await response.text()
+    const { text: cleanText, wasRedacted } = redactSecret(rawText, secretValue)
+    redacted = wasRedacted
+    try {
+      body = JSON.parse(cleanText)
+    } catch {
+      // If redaction broke JSON parsing, return as text
+      body = cleanText
+    }
   } else {
-    body = await response.text()
+    const rawText = await response.text()
+    const { text: cleanText, wasRedacted } = redactSecret(rawText, secretValue)
+    redacted = wasRedacted
+    body = cleanText
+  }
+
+  if (redacted) {
+    logger.warn("Response body contained leaked secret — redacted", {
+      url,
+      method: method.toUpperCase(),
+      // Deliberately NOT logging which secret or what was redacted
+    })
   }
 
   logger.info("Outbound proxy response", {
     status: response.status,
     latencyMs,
     url,
+    redacted,
   })
 
   return {
@@ -118,3 +159,35 @@ export async function injectAndProxy(
     latencyMs,
   }
 }
+
+/**
+ * Scan text for the secret value and replace all occurrences.
+ * Only redacts if the secret is at least 8 characters (avoid false positives).
+ */
+function redactSecret(text: string, secret: string): { text: string; wasRedacted: boolean } {
+  if (secret.length < 8) {
+    // Short secrets risk false positives — skip body redaction
+    // (header stripping still protects these)
+    return { text, wasRedacted: false }
+  }
+
+  if (!text.includes(secret)) {
+    return { text, wasRedacted: false }
+  }
+
+  return {
+    text: text.replaceAll(secret, "[REDACTED_BY_LAURIN]"),
+    wasRedacted: true,
+  }
+}
+
+/** Custom error for SSRF blocks — handler.ts can catch and return 403 */
+export class SsrfBlockedError extends Error {
+  constructor(reason: string) {
+    super(reason)
+    this.name = "SsrfBlockedError"
+  }
+}
+
+// Export for testing
+export { redactSecret }
